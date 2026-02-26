@@ -54,6 +54,12 @@
 .PARAMETER Timeout
     SSH connection timeout in seconds. Defaults to 30.
 
+.PARAMETER MaxPageIterations
+    Maximum number of paging prompts (--More-- / ---(more)---) to advance
+    through per command before stopping. Prevents infinite loops on runaway
+    output. Defaults to 100. Override with a higher value for very long
+    command outputs (e.g. -MaxPageIterations 500).
+
 .PARAMETER OutputDir
     Directory where output .txt files will be saved.
     Created automatically if it does not exist. Defaults to the current directory.
@@ -112,6 +118,10 @@ param (
     [Parameter()]
     [int]$Timeout = 30,
 
+    [Parameter()]
+    [ValidateRange(1, 10000)]
+    [int]$MaxPageIterations = 100,
+
     # --- Output ---
     [Parameter()]
     [string]$OutputDir = '.'
@@ -128,6 +138,15 @@ $ErrorActionPreference = 'Stop'
 
 # Delay in milliseconds to wait for the initial SSH banner to arrive.
 [int]$script:intBannerDelayMs  = 1000
+
+# Regex pattern that matches common "press key to continue" paging prompts.
+# Covers: ---(more)--- | --More-- / --more-- (Cisco IOS) | <---More--->
+[string]$script:strPagePattern = '---\(more\)---|--\(?[Mm]ore\)?--|<---More--->'
+
+# Keystroke used to advance past a paging prompt.
+# Starts as Space (most common); automatically toggled to Tab if Space fails.
+# Reset to Space at the start of each device session.
+[string]$script:strPageKey = ' '
 
 # ---------------------------------------------------------------------------
 # Helper: Write a timestamped log message to the console.
@@ -357,6 +376,90 @@ function Save-OutputFile {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: Read all pages of output from an SSH shell stream.
+# Handles paging prompts like --More-- and ---(more)--- by sending Space
+# (or Tab) keystrokes to advance. Toggles Space<->Tab when one fails.
+# The successful key is remembered in $script:strPageKey for the session.
+# ---------------------------------------------------------------------------
+function Read-StreamUntilComplete {
+    <#
+    .SYNOPSIS
+        Read all pages of output from an SSH shell stream.
+    .DESCRIPTION
+        Performs an initial Read(), then loops while a paging prompt is
+        detected in the latest chunk of output. On each page it sends the
+        current $script:strPageKey (Space by default). If Space produces
+        no new output, it toggles to Tab and retries. The working key is
+        remembered across calls within the same device session.
+        Stops when no paging prompt is found or MaxIterations is reached.
+    .PARAMETER objStream
+        The Posh-SSH SSHShellStream to read from.
+    .PARAMETER strHost
+        Device hostname/IP used in log messages.
+    .PARAMETER intDelayMs
+        Milliseconds to wait after each keystroke before reading again.
+    .PARAMETER intMaxIterations
+        Maximum number of page-advances before stopping (safety limit).
+    .OUTPUTS
+        String containing all accumulated output with paging prompts removed.
+    #>
+    param (
+        [object]$objStream,
+        [string]$strHost,
+        [int]$intDelayMs,
+        [int]$intMaxIterations
+    )
+
+    # Read the initial chunk of output from the stream
+    $strChunk       = $objStream.Read()
+    $strAccumulated = $strChunk
+    [int]$intPageCount = 0
+
+    # Loop while the most recent chunk contains a paging prompt
+    while ($strChunk -match $script:strPagePattern) {
+
+        # Safety: stop if we've exceeded the maximum number of pages
+        if ($intPageCount -ge $intMaxIterations) {
+            Write-LogWarning "[$strHost] Max page iterations ($intMaxIterations) reached - output may be incomplete."
+            break
+        }
+        $intPageCount++
+
+        # Send the current page-advance keystroke (no newline) and wait
+        $objStream.Write($script:strPageKey)
+        Start-Sleep -Milliseconds $intDelayMs
+        $strChunk = $objStream.Read()
+
+        # If the current key produced no new output, toggle Space<->Tab and retry
+        if ([string]::IsNullOrEmpty($strChunk)) {
+            $strOldKeyName     = if ($script:strPageKey -eq ' ') { 'Space' } else { 'Tab' }
+            $script:strPageKey = if ($script:strPageKey -eq ' ') { "`t"   } else { ' '  }
+            $strNewKeyName     = if ($script:strPageKey -eq ' ') { 'Space' } else { 'Tab' }
+            Write-LogWarning "[$strHost] Paging key '$strOldKeyName' produced no output at page $intPageCount; switching to '$strNewKeyName'."
+
+            $objStream.Write($script:strPageKey)
+            Start-Sleep -Milliseconds $intDelayMs
+            $strChunk = $objStream.Read()
+        }
+
+        # If both keys failed, abort the paging loop
+        if ([string]::IsNullOrEmpty($strChunk)) {
+            Write-LogWarning "[$strHost] Both Space and Tab failed to advance pager at page $intPageCount. Stopping."
+            break
+        }
+
+        $strAccumulated += $strChunk
+    }
+
+    # Strip all paging prompt lines from the final output so they don't
+    # appear in the saved config file.
+    $strAccumulated = $strAccumulated -replace '(?m)[ \t]*(?:---\(more\)---|--\(?[Mm]ore\)?--|<---More--->)[ \t]*\r?\n?', ''
+
+    Write-Verbose "[$strHost] Read-StreamUntilComplete: $intPageCount page(s) advanced, $($strAccumulated.Length) chars total."
+    return $strAccumulated
+}
+
+# ---------------------------------------------------------------------------
 # Core: Connect to a single device and run all commands.
 # Returns the captured output as a string, or $null on failure.
 # ---------------------------------------------------------------------------
@@ -383,6 +486,8 @@ function Invoke-DeviceCommands {
         Array of command strings to execute.
     .PARAMETER intTimeout
         SSH connection timeout in seconds.
+    .PARAMETER intMaxPageIterations
+        Maximum paging advances per command (passed to Read-StreamUntilComplete).
     .OUTPUTS
         String containing all captured output, or $null on failure.
     #>
@@ -394,7 +499,8 @@ function Invoke-DeviceCommands {
         [bool]$boolEnableMode,
         [SecureString]$secEnablePassword,
         [string[]]$listCommands,
-        [int]$intTimeout
+        [int]$intTimeout,
+        [int]$intMaxPageIterations
     )
 
     $objSession = $null
@@ -403,15 +509,19 @@ function Invoke-DeviceCommands {
     try {
         Write-Log "[$strHost] Connecting on port $intDevicePort ..."
 
+        # Reset the page-advance key to Space at the start of each device
+        # session so each device gets a fair first attempt with Space.
+        $script:strPageKey = ' '
+
         # Build the connection parameter hashtable dynamically
         # so we can conditionally add -KeyFile without branching the call.
         $dictConnectParams = @{
-            ComputerName     = $strHost
-            Port             = $intDevicePort
-            Credential       = $objCredential
+            ComputerName      = $strHost
+            Port              = $intDevicePort
+            Credential        = $objCredential
             ConnectionTimeout = $intTimeout
-            AcceptKey        = $true        # Auto-accept unknown host keys (equiv. to AutoAddPolicy)
-            ErrorAction      = 'Stop'
+            AcceptKey         = $true        # Auto-accept unknown host keys (equiv. to AutoAddPolicy)
+            ErrorAction       = 'Stop'
         }
 
         # Add the key file if one was specified
@@ -451,15 +561,20 @@ function Invoke-DeviceCommands {
 
             # Convert the SecureString enable password back to plain text
             # to send it over the SSH channel, then immediately discard it.
-            $objBSTR          = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secEnablePassword)
-            $strEnablePlain   = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($objBSTR)
+            $objBSTR        = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secEnablePassword)
+            $strEnablePlain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($objBSTR)
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($objBSTR)   # zero memory immediately
 
             $objStream.WriteLine($strEnablePlain)
             $strEnablePlain = $null   # release reference
             Start-Sleep -Milliseconds $script:intCommandDelayMs
 
-            $strEnableResponse = $objStream.Read()
+            # Use Read-StreamUntilComplete in case the enable response is paged
+            $strEnableResponse = Read-StreamUntilComplete `
+                -objStream        $objStream `
+                -strHost          $strHost `
+                -intDelayMs       $script:intCommandDelayMs `
+                -intMaxIterations $intMaxPageIterations
             $listOutputParts.Add($strEnableResponse)
             Write-Log "[$strHost] Enable mode active."
         }
@@ -471,7 +586,14 @@ function Invoke-DeviceCommands {
             $objStream.WriteLine($strCmd)
             Start-Sleep -Milliseconds $script:intCommandDelayMs
 
-            $strCmdOutput = $objStream.Read()
+            # Read-StreamUntilComplete handles --More-- / ---(more)--- paging
+            # automatically, advancing with Space (or Tab) until all output
+            # is received, then strips the paging prompts from the result.
+            $strCmdOutput = Read-StreamUntilComplete `
+                -objStream        $objStream `
+                -strHost          $strHost `
+                -intDelayMs       $script:intCommandDelayMs `
+                -intMaxIterations $intMaxPageIterations
             $listOutputParts.Add($strCmdOutput)
 
             Write-Verbose "[$strHost] Output length: $($strCmdOutput.Length) chars"
@@ -582,14 +704,15 @@ foreach ($dictDevice in $listTargetDevices) {
     Write-Log "Processing device: $strHost (port $intDevicePort)"
 
     $strOutput = Invoke-DeviceCommands `
-        -strHost        $strHost `
-        -intDevicePort  $intDevicePort `
-        -objCredential  $objCredential `
-        -strKeyFile     $KeyFile `
-        -boolEnableMode ($Enable.IsPresent) `
-        -secEnablePassword $secEnablePassword `
-        -listCommands   $arrCommands `
-        -intTimeout     $Timeout
+        -strHost              $strHost `
+        -intDevicePort        $intDevicePort `
+        -objCredential        $objCredential `
+        -strKeyFile           $KeyFile `
+        -boolEnableMode       ($Enable.IsPresent) `
+        -secEnablePassword    $secEnablePassword `
+        -listCommands         $arrCommands `
+        -intTimeout           $Timeout `
+        -intMaxPageIterations $MaxPageIterations
 
     if ($null -ne $strOutput) {
         $strOutFile = Get-OutputFilePath -strOutputDir $OutputDir -strHost $strHost
