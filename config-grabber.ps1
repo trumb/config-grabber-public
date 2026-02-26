@@ -122,6 +122,10 @@ param (
     [ValidateRange(1, 10000)]
     [int]$MaxPageIterations = 100,
 
+    # --- Connection security ---
+    [Parameter()]
+    [switch]$IgnoreHostKeyMismatch,
+
     # --- Output ---
     [Parameter()]
     [string]$OutputDir = '.'
@@ -491,8 +495,6 @@ function Invoke-DeviceCommands {
         Array of command strings to execute.
     .PARAMETER intTimeout
         SSH connection timeout in seconds.
-    .PARAMETER intMaxPageIterations
-        Maximum paging advances per command (passed to Read-StreamUntilComplete).
     .OUTPUTS
         String containing all captured output, or $null on failure.
     #>
@@ -505,7 +507,8 @@ function Invoke-DeviceCommands {
         [SecureString]$secEnablePassword,
         [string[]]$listCommands,
         [int]$intTimeout,
-        [int]$intMaxPageIterations
+        [int]$intMaxPageIterations,
+        [bool]$boolIgnoreHostKeyMismatch
     )
 
     $objSession = $null
@@ -518,25 +521,26 @@ function Invoke-DeviceCommands {
         # session so each device gets a fair first attempt with Space.
         $script:strPageKey = ' '
 
-        # --- Clear any cached SSH host key for this IP to handle PAT scenarios ---
-        # In PAT environments, the same public IP maps to different internal devices
-        # via different ports. Each device has its own SSH host key. Posh-SSH caches
-        # keys per IP address (ignoring port), so a second connection to the same IP
-        # with a different port/device presents a different key and Posh-SSH raises a
-        # host key mismatch error - even when AcceptKey=$true is set (which only
-        # accepts *unknown* keys, not *mismatched* ones).
-        # Removing the cached key before each connection lets AcceptKey=$true treat
-        # every connection as a fresh unknown-host acceptance.
-        try {
-            $objTrustedHost = Get-SSHTrustedHost | Where-Object { $_.SSHHost -eq $strHost }
-            if ($null -ne $objTrustedHost) {
-                Write-Verbose "[$strHost] Removing cached SSH host key for PAT compatibility."
-                Remove-SSHTrustedHost -SSHHost $strHost -ErrorAction SilentlyContinue | Out-Null
+        # --- Clear cached SSH host keys when -IgnoreHostKeyMismatch is set ---
+        # In PAT/NAT environments, the same public IP maps to different internal
+        # devices via different ports. Each device has its own SSH host key but
+        # Posh-SSH caches keys per IP (ignoring port), so a second device on the
+        # same IP causes a mismatch. AcceptKey=$true only handles *unknown* keys,
+        # not *mismatched* ones. When IgnoreHostKeyMismatch is enabled we
+        # aggressively remove ALL cached keys for this IP before connecting so
+        # that AcceptKey=$true can accept each device's key fresh.
+        if ($boolIgnoreHostKeyMismatch) {
+            try {
+                # Remove every cached entry for this IP, regardless of key type.
+                # ForEach-Object handles the case where multiple key types are stored.
+                Get-SSHTrustedHost | Where-Object { $_.SSHHost -eq $strHost } | ForEach-Object {
+                    Remove-SSHTrustedHost -SSHHost $strHost -ErrorAction SilentlyContinue | Out-Null
+                }
+                Write-Verbose "[$strHost] Cleared all cached SSH host keys (-IgnoreHostKeyMismatch)."
             }
-        }
-        catch {
-            # Non-fatal: the host may simply not be in the cache yet, which is fine.
-            Write-Verbose "[$strHost] No cached SSH host key to remove (or removal failed - continuing)."
+            catch {
+                Write-Verbose "[$strHost] No cached SSH host key to remove (or removal failed - continuing)."
+            }
         }
 
         # Build the connection parameter hashtable dynamically
@@ -587,8 +591,8 @@ function Invoke-DeviceCommands {
 
             # Convert the SecureString enable password back to plain text
             # to send it over the SSH channel, then immediately discard it.
-            $objBSTR        = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secEnablePassword)
-            $strEnablePlain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($objBSTR)
+            $objBSTR          = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secEnablePassword)
+            $strEnablePlain   = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($objBSTR)
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($objBSTR)   # zero memory immediately
 
             $objStream.WriteLine($strEnablePlain)
@@ -597,9 +601,9 @@ function Invoke-DeviceCommands {
 
             # Use Read-StreamUntilComplete in case the enable response is paged
             $strEnableResponse = Read-StreamUntilComplete `
-                -objStream        $objStream `
-                -strHost          $strHost `
-                -intDelayMs       $script:intCommandDelayMs `
+                -objStream       $objStream `
+                -strHost         $strHost `
+                -intDelayMs      $script:intCommandDelayMs `
                 -intMaxIterations $intMaxPageIterations
             $listOutputParts.Add($strEnableResponse)
             Write-Log "[$strHost] Enable mode active."
@@ -616,9 +620,9 @@ function Invoke-DeviceCommands {
             # automatically, advancing with Space (or Tab) until all output
             # is received, then strips the paging prompts from the result.
             $strCmdOutput = Read-StreamUntilComplete `
-                -objStream        $objStream `
-                -strHost          $strHost `
-                -intDelayMs       $script:intCommandDelayMs `
+                -objStream       $objStream `
+                -strHost         $strHost `
+                -intDelayMs      $script:intCommandDelayMs `
                 -intMaxIterations $intMaxPageIterations
             $listOutputParts.Add($strCmdOutput)
 
@@ -688,15 +692,33 @@ Write-Log "Loaded $($arrCommands.Count) command(s) to execute."
 # Resolve credentials
 # ---------------------------------------------------------------------------
 
-# SSH password: prompt securely if not supplied via -Password
-if ($null -eq $Password -and [string]::IsNullOrWhiteSpace($KeyFile)) {
-    # Neither password nor key provided - must prompt
-    $Password = Read-Host -Prompt "SSH password for user '$Username'" -AsSecureString
+# Password resolution priority:
+#   1. Explicit -Password argument (already in $Password if supplied)
+#   2. CONFIG_GRABBER_PASSWORD environment variable
+#   3. Key-only auth (if -KeyFile is set, no password needed)
+#   4. Interactive secure prompt (last resort)
+if ($null -eq $Password) {
+    # Check environment variable first
+    $strEnvPassword = $env:CONFIG_GRABBER_PASSWORD
+    if (-not [string]::IsNullOrWhiteSpace($strEnvPassword)) {
+        Write-Log 'Credential source: CONFIG_GRABBER_PASSWORD environment variable.'
+        $Password = ConvertTo-SecureString -String $strEnvPassword -AsPlainText -Force
+        $strEnvPassword = $null   # clear plain text reference
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($KeyFile)) {
+        # Key file was given; create a dummy empty-password credential for Posh-SSH.
+        # Posh-SSH requires a PSCredential even for key auth.
+        Write-Log 'Credential source: key-only authentication (no password).'
+        $Password = New-Object SecureString
+    }
+    else {
+        # Neither password, env var, nor key provided - must prompt
+        Write-Log 'No stored credential found. Prompting for SSH password.'
+        $Password = Read-Host -Prompt "SSH password for user '$Username'" -AsSecureString
+    }
 }
-elseif ($null -eq $Password) {
-    # Key file was given; create a dummy empty-password credential for Posh-SSH.
-    # Posh-SSH requires a PSCredential even for key auth.
-    $Password = New-Object SecureString
+else {
+    Write-Verbose 'Credential source: explicit -Password argument.'
 }
 
 # Build the PSCredential object required by New-SSHSession
@@ -730,15 +752,16 @@ foreach ($dictDevice in $listTargetDevices) {
     Write-Log "Processing device: $strHost (port $intDevicePort)"
 
     $strOutput = Invoke-DeviceCommands `
-        -strHost              $strHost `
-        -intDevicePort        $intDevicePort `
-        -objCredential        $objCredential `
-        -strKeyFile           $KeyFile `
-        -boolEnableMode       ($Enable.IsPresent) `
-        -secEnablePassword    $secEnablePassword `
-        -listCommands         $arrCommands `
-        -intTimeout           $Timeout `
-        -intMaxPageIterations $MaxPageIterations
+        -strHost                  $strHost `
+        -intDevicePort            $intDevicePort `
+        -objCredential            $objCredential `
+        -strKeyFile               $KeyFile `
+        -boolEnableMode           ($Enable.IsPresent) `
+        -secEnablePassword        $secEnablePassword `
+        -listCommands             $arrCommands `
+        -intTimeout               $Timeout `
+        -intMaxPageIterations     $MaxPageIterations `
+        -boolIgnoreHostKeyMismatch ($IgnoreHostKeyMismatch.IsPresent)
 
     if ($null -ne $strOutput) {
         $strOutFile = Get-OutputFilePath -strOutputDir $OutputDir -strHost $strHost
