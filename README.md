@@ -1,187 +1,207 @@
 # config-grabber
 
-A Python utility that SSH's into network switches, runs a list of commands, and saves
-the output to timestamped text files — one file per device.
+SSH into network switches, run a list of commands, and save the output to timestamped text files — one file per device.
 
-## Features
+Available in **two implementations** — choose the one that fits your environment:
+
+| | Python | PowerShell |
+|---|---|---|
+| **Script** | `config_grabber.py` | `config-grabber.ps1` |
+| **Dependency** | `pip install paramiko` | `Install-Module Posh-SSH` |
+| **Platform** | Windows / macOS / Linux | Windows (PowerShell 5.1+) |
+| **Password auth** | ✅ Secure prompt | ✅ `Read-Host -AsSecureString` |
+| **SSH key auth** | ✅ RSA / Ed25519 | ✅ via Posh-SSH |
+| **Enable mode** | ✅ | ✅ |
+| **Per-device ports** | ✅ `IP:PORT` | ✅ `IP:PORT` |
+
+---
+
+## Features (both versions)
 
 - Connect to **one or many switches** via IP address or a text file list
 - **Per-device port support** using `IP:PORT` notation for PAT/NAT environments
-- Support for **password** and **SSH key** authentication
+- **Password** or **SSH key** authentication
 - Optional **enable / privileged EXEC mode** (Cisco-style)
-- Each device's output saved as **`<IP>_<YYYY-MM-DDTHHMMSS>.txt`**
-- Graceful error handling — a failed device doesn't stop the rest
-- Secure password prompting (no passwords stored in shell history)
+- Output saved as **`<IP>_<YYYY-MM-DDTHHMMSS>.txt`** per device
+- Graceful error handling — a failed device is logged and skipped
 
-## Requirements
+---
+
+## Python Version
+
+### Requirements
 
 - Python 3.10 or later
-- [paramiko](https://www.paramiko.org/) SSH library
-
-### Install dependencies
+- `paramiko` library
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> **Tip:** Use a virtual environment to keep dependencies isolated:
-> ```bash
-> python -m venv .venv
-> .venv\Scripts\activate      # Windows
-> source .venv/bin/activate   # macOS / Linux
-> pip install -r requirements.txt
-> ```
-
-## Usage
-
-```
-python config_grabber.py [-h] (-i IP[,IP,...] | -f FILE) -c FILE -u USER
-                         [-p PASS] [-k KEY_FILE] [-e] [--port PORT]
-                         [-t SECONDS] [-o DIR] [-v]
-```
-
-### Arguments
-
-| Argument | Description |
-|---|---|
-| `-i IP[,IP,...]` | Single IP or comma-separated list of IPs. Supports `IP:PORT` notation per device. |
-| `-f FILE` | Text file with one IP per line (mutually exclusive with `-i`). Supports `IP:PORT` per line. |
-| `-c FILE` | **Required.** Text file with commands to run (one per line) |
-| `-u USER` | **Required.** SSH username |
-| `-p PASS` | SSH password (prompted securely if omitted) |
-| `-k KEY_FILE` | SSH private key file for key-based authentication |
-| `-e` | Enter privileged EXEC (enable) mode after login |
-| `--port PORT` | Default SSH port when no per-device port is specified (default: `22`) |
-| `-t SECONDS` | Connection timeout in seconds (default: `30`) |
-| `-o DIR` | Output directory (default: current directory) |
-| `-v` | Enable verbose/debug logging |
-
-## Examples
-
-### Connect to a single switch, prompt for password
+### Usage
 
 ```bash
+python config_grabber.py (-i IP[,IP,...] | -f FILE) -c FILE -u USER
+                         [-p PASS] [-k KEY_FILE] [-e]
+                         [--port PORT] [-t SECONDS] [-o DIR] [-v]
+```
+
+### Quick examples
+
+```bash
+# Single switch — prompted for password
 python config_grabber.py -i 192.168.1.1 -c examples/commands.txt -u admin
-```
 
-### Connect to multiple switches from a file, save output to `./output`
-
-```bash
+# Device file, save to ./output
 python config_grabber.py -f examples/devices.txt -c examples/commands.txt -u admin -o output
+
+# SSH key + enable mode
+python config_grabber.py -f examples/devices.txt -c examples/commands.txt -u admin -k ~/.ssh/id_rsa -e -o output
+
+# PAT/NAT — per-device ports
+python config_grabber.py -i "203.0.113.1:2221,203.0.113.1:2222" -c examples/commands.txt -u admin
 ```
 
-### Use SSH key authentication
+---
 
-```bash
-python config_grabber.py -f examples/devices.txt -c examples/commands.txt -u admin -k ~/.ssh/id_rsa -o output
+## PowerShell Version
+
+### Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+
+- [Posh-SSH](https://www.powershellgallery.com/packages/Posh-SSH) module
+
+```powershell
+Install-Module -Name Posh-SSH -Scope CurrentUser
 ```
 
-### Enter enable mode (Cisco IOS)
+### Usage
 
-```bash
-python config_grabber.py -i 192.168.1.1 -c examples/commands.txt -u admin -e -o output
+```powershell
+.\config-grabber.ps1 [-IP <string> | -DeviceFile <path>]
+                     -CommandFile <path> -Username <string>
+                     [-Password <SecureString>] [-KeyFile <path>]
+                     [-Enable] [-Port <int>] [-Timeout <int>]
+                     [-OutputDir <path>] [-Verbose]
 ```
 
-### Multiple IPs, custom port, verbose output
+### Quick examples
 
-```bash
-python config_grabber.py -i 10.0.0.1,10.0.0.2 -c examples/commands.txt -u netops --port 2222 -v -o output
+```powershell
+# Single switch — prompted for password
+.\config-grabber.ps1 -IP 192.168.1.1 -CommandFile examples\commands.txt -Username admin
+
+# Device file, save to .\output
+.\config-grabber.ps1 -DeviceFile examples\devices.txt -CommandFile examples\commands.txt -Username admin -OutputDir .\output
+
+# SSH key + enable mode
+.\config-grabber.ps1 -DeviceFile examples\devices.txt -CommandFile examples\commands.txt -Username admin -KeyFile C:\Users\me\.ssh\id_rsa -Enable -OutputDir .\output
+
+# PAT/NAT — per-device ports
+.\config-grabber.ps1 -IP "203.0.113.1:2221,203.0.113.1:2222" -CommandFile examples\commands.txt -Username admin
 ```
 
-### PAT/NAT environments — per-device ports on the CLI
-
-```bash
-# Each device has its own SSH port (PAT through a firewall)
-python config_grabber.py -i 203.0.113.1:2221,203.0.113.1:2222 -c examples/commands.txt -u admin -o output
-```
-
-### PAT/NAT environments — per-device ports in a file
-
-```bash
-python config_grabber.py -f examples/devices.txt -c examples/commands.txt -u admin -o output
-```
+---
 
 ## Input File Formats
 
-### devices.txt (IP list)
+Both versions use the same file formats.
 
-Bare IPs use the `--port` default. Add `:PORT` to override per device:
+### devices.txt
 
 ```
-# Lines starting with '#' are comments - they are ignored
-# Blank lines are also ignored
+# Lines starting with '#' are comments — ignored
+# Blank lines are ignored
 
-# Standard port (uses --port default, typically 22)
+# Standard SSH port (uses --port / -Port default, typically 22)
 192.168.1.1
 192.168.1.2
 
-# PAT'd devices with custom per-device ports
+# PAT'd devices with per-device ports
 10.0.0.1:2221
 10.0.0.2:2222
 ```
 
-### commands.txt (command list)
+### commands.txt
 
 ```
-# Commands for Cisco IOS switches
-# One command per line
-
+# Cisco IOS example — one command per line
 terminal length 0
 show version
 show ip interface brief
 show running-config
 ```
 
+---
+
 ## Output
 
-Each device produces one output file in the specified directory:
+Each device produces one output file per run:
 
 ```
 output/
 ├── 192.168.1.1_2026-02-26T101930.txt
-├── 192.168.1.2_2026-02-26T101935.txt
-└── 10.0.0.1_2026-02-26T101940.txt
+├── 10.0.0.1_2026-02-26T101936.txt
 ```
 
-Each file begins with a small header:
+Each file starts with a metadata header:
 
 ```
 # Config Grabber Output
 # Device  : 192.168.1.1
-# Captured: 2026-02-26T10:19:30.123456
+# Captured: 2026-02-26T10:19:30
 # ============================================================
 
-Switch> terminal length 0
-Switch> show version
-Cisco IOS XE Software, Version 17.09.04a
+Switch>terminal length 0
+Switch>show version
 ...
 ```
 
+---
+
+## PAT / NAT Environments
+
+Use `IP:PORT` notation anywhere a device is specified:
+
+```
+# devices.txt
+192.168.1.1          ← uses default port (22)
+203.0.113.1:2221     ← per-device port
+203.0.113.1:2222     ← per-device port
+```
+
+```bash
+# or inline
+python config_grabber.py -i "203.0.113.1:2221,203.0.113.1:2222" ...
+.\config-grabber.ps1  -IP "203.0.113.1:2221,203.0.113.1:2222" ...
+```
+
+---
+
 ## Security Notes
 
-- **Never pass passwords on the command line in production** — use the prompt
-  (`-p` omitted) or SSH key authentication (`-k`)
-- The script uses `AutoAddPolicy` for host key verification (accepts all host keys
-  automatically). For high-security environments, replace this with `RejectPolicy`
-  and maintain a `known_hosts` file
-- Output files may contain sensitive device configuration — store them securely
+- Passwords are always **prompted securely** — never stored in shell history
+- Enable passwords are handled securely in both versions
+- SSH host keys are auto-accepted by default (suitable for trusted networks)
+- Output files may contain sensitive device config — store them securely
 
 ## Exit Codes
 
 | Code | Meaning |
 |---|---|
 | `0` | All devices processed successfully |
-| `1` | One or more devices failed (connection error, auth failure, etc.) |
+| `1` | One or more devices failed |
 
 ## Project Structure
 
 ```
-config-grabber/
-├── config_grabber.py       # Main script
+config-grabber-public/
+├── config_grabber.py       # Python implementation
+├── config-grabber.ps1      # PowerShell implementation
 ├── requirements.txt        # Python dependencies
-├── README.md               # This file
-├── examples/
-│   ├── devices.txt         # Example IP address list
-│   └── commands.txt        # Example commands file
-└── output/                 # Default output directory (git-ignored)
+├── README.md
+├── .gitignore
+└── examples/
+    ├── devices.txt         # Example IP list (shared by both)
+    └── commands.txt        # Example Cisco IOS commands (shared)
 ```

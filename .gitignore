@@ -39,9 +39,13 @@ output/
 *.pem
 *.key
 *.p12
+*.ppk
 id_rsa
 id_ed25519
 id_ecdsa
+
+# PowerShell temp files
+*.ps1xml
 
 # Secrets / environment variable files
 .env
