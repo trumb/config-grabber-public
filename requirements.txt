@@ -1,0 +1,6 @@
+# config-grabber dependencies
+# Install with: pip install -r requirements.txt
+
+# paramiko - SSH2 protocol library for Python
+# Used for all SSH connections to network switches
+paramiko>=3.4.0

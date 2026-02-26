@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+*.pyo
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE / editor files
+.vscode/settings.json
+*.code-workspace
+!config-grabber.code-workspace
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Output files (captured switch configs)
+# These contain device configuration data - do not commit
+output/
+*.txt
+# But DO track these specific text files
+!requirements.txt
+!examples/*.txt
+
+# SSH private keys - never commit credentials
+*.pem
+*.key
+*.p12
+id_rsa
+id_ed25519
+id_ecdsa
+
+# Secrets / environment variable files
+.env
+.env.*
+secrets.*
+credentials.*

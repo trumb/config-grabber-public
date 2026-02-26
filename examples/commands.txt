@@ -1,0 +1,35 @@
+# commands.txt - Commands to run on each switch
+# One command per line.
+# Lines starting with '#' are treated as comments and ignored.
+# Blank lines are also ignored.
+#
+# These example commands are for Cisco IOS/IOS-XE switches.
+# Adjust for your specific platform (Arista EOS, HP ProCurve, Juniper, etc.)
+#
+# NOTE: If connecting to a device that uses pagination (--More--), consider
+# disabling it first with: terminal length 0
+
+# Disable paging so output is not interrupted (Cisco IOS)
+terminal length 0
+
+# Basic device identity
+show version
+show hostname
+
+# Interface status
+show interfaces status
+show ip interface brief
+
+# Routing and ARP
+show ip route
+show arp
+
+# VLAN and spanning tree
+show vlan brief
+show spanning-tree summary
+
+# CDP/LLDP neighbours
+show cdp neighbors detail
+
+# Running configuration (full)
+show running-config

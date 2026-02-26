@@ -1,0 +1,79 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        // Editor behaviour
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.formatOnSave": true,
+        "editor.rulers": [100],
+        "files.trimTrailingWhitespace": true,
+        "files.insertFinalNewline": true,
+        "files.trimFinalNewlines": true,
+
+        // Python-specific settings
+        "python.languageServer": "Pylance",
+        "python.analysis.typeCheckingMode": "basic",
+        "python.analysis.autoImportCompletions": true,
+        "[python]": {
+            "editor.defaultFormatter": "ms-python.black-formatter",
+            "editor.formatOnSave": true
+        },
+
+        // Git
+        "git.defaultBranchName": "main",
+        "git.autofetch": true,
+
+        // File exclusions (keep explorer clean)
+        "files.exclude": {
+            "**/__pycache__": true,
+            "**/*.pyc": true,
+            "**/.mypy_cache": true,
+            "**/.pytest_cache": true,
+            "**/dist": true,
+            "**/build": true,
+            "**/*.egg-info": true
+        },
+        "search.exclude": {
+            "**/output": true,
+            "**/__pycache__": true,
+            "**/.venv": true,
+            "**/venv": true
+        }
+    },
+    "extensions": {
+        "recommendations": [
+            // Cline AI assistant
+            "saoudrizwan.claude-dev",
+            // Python support
+            "ms-python.python",
+            "ms-python.pylance",
+            "ms-python.black-formatter",
+            // General utilities
+            "redhat.vscode-yaml",
+            "ms-vscode.vscode-json"
+        ]
+    },
+    "launch": {
+        "version": "0.2.0",
+        "configurations": [
+            {
+                "name": "Run config_grabber (example)",
+                "type": "debugpy",
+                "request": "launch",
+                "program": "${workspaceFolder}/config_grabber.py",
+                "args": [
+                    "-f", "examples/devices.txt",
+                    "-c", "examples/commands.txt",
+                    "-u", "admin",
+                    "-o", "output",
+                    "-v"
+                ],
+                "console": "integratedTerminal"
+            }
+        ]
+    }
+}
