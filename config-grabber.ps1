@@ -140,8 +140,11 @@ $ErrorActionPreference = 'Stop'
 [int]$script:intBannerDelayMs  = 1000
 
 # Regex pattern that matches common "press key to continue" paging prompts.
-# Covers: ---(more)--- | --More-- / --more-- (Cisco IOS) | <---More--->
-[string]$script:strPagePattern = '---\(more\)---|--\(?[Mm]ore\)?--|<---More--->'
+# Uses prefix matching so variants like ---(more 38%)--- are also caught:
+#   ---\(more  matches ---(more)---, ---(more 38%)---, ---(more 100%)--- etc.
+#   --\(?[Mm]ore  matches --More--, --more--, --(More)--, --(more)-- etc.
+#   <---More   matches <---More---> and similar variants
+[string]$script:strPagePattern = '---\(more|--\(?[Mm]ore|<---More'
 
 # Keystroke used to advance past a paging prompt.
 # Starts as Space (most common); automatically toggled to Tab if Space fails.
@@ -453,7 +456,9 @@ function Read-StreamUntilComplete {
 
     # Strip all paging prompt lines from the final output so they don't
     # appear in the saved config file.
-    $strAccumulated = $strAccumulated -replace '(?m)[ \t]*(?:---\(more\)---|--\(?[Mm]ore\)?--|<---More--->)[ \t]*\r?\n?', ''
+    # Uses [^\r\n]* to greedily consume the rest of the prompt line so that
+    # variants like ---(more 38%)--- are fully removed, not just the prefix.
+    $strAccumulated = $strAccumulated -replace '(?m)[ \t]*(?:---\(more[^\r\n]*|--\(?[Mm]ore[^\r\n]*|<---More[^\r\n]*)[ \t]*\r?\n?', ''
 
     Write-Verbose "[$strHost] Read-StreamUntilComplete: $intPageCount page(s) advanced, $($strAccumulated.Length) chars total."
     return $strAccumulated
