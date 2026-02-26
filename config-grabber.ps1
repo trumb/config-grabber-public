@@ -518,6 +518,27 @@ function Invoke-DeviceCommands {
         # session so each device gets a fair first attempt with Space.
         $script:strPageKey = ' '
 
+        # --- Clear any cached SSH host key for this IP to handle PAT scenarios ---
+        # In PAT environments, the same public IP maps to different internal devices
+        # via different ports. Each device has its own SSH host key. Posh-SSH caches
+        # keys per IP address (ignoring port), so a second connection to the same IP
+        # with a different port/device presents a different key and Posh-SSH raises a
+        # host key mismatch error - even when AcceptKey=$true is set (which only
+        # accepts *unknown* keys, not *mismatched* ones).
+        # Removing the cached key before each connection lets AcceptKey=$true treat
+        # every connection as a fresh unknown-host acceptance.
+        try {
+            $objTrustedHost = Get-SSHTrustedHost | Where-Object { $_.SSHHost -eq $strHost }
+            if ($null -ne $objTrustedHost) {
+                Write-Verbose "[$strHost] Removing cached SSH host key for PAT compatibility."
+                Remove-SSHTrustedHost -SSHHost $strHost -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+        catch {
+            # Non-fatal: the host may simply not be in the cache yet, which is fine.
+            Write-Verbose "[$strHost] No cached SSH host key to remove (or removal failed - continuing)."
+        }
+
         # Build the connection parameter hashtable dynamically
         # so we can conditionally add -KeyFile without branching the call.
         $dictConnectParams = @{
