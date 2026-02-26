@@ -6,6 +6,7 @@ the output to timestamped text files — one file per device.
 ## Features
 
 - Connect to **one or many switches** via IP address or a text file list
+- **Per-device port support** using `IP:PORT` notation for PAT/NAT environments
 - Support for **password** and **SSH key** authentication
 - Optional **enable / privileged EXEC mode** (Cisco-style)
 - Each device's output saved as **`<IP>_<YYYY-MM-DDTHHMMSS>.txt`**
@@ -43,14 +44,14 @@ python config_grabber.py [-h] (-i IP[,IP,...] | -f FILE) -c FILE -u USER
 
 | Argument | Description |
 |---|---|
-| `-i IP[,IP,...]` | Single IP or comma-separated list of IPs |
-| `-f FILE` | Text file with one IP per line (mutually exclusive with `-i`) |
+| `-i IP[,IP,...]` | Single IP or comma-separated list of IPs. Supports `IP:PORT` notation per device. |
+| `-f FILE` | Text file with one IP per line (mutually exclusive with `-i`). Supports `IP:PORT` per line. |
 | `-c FILE` | **Required.** Text file with commands to run (one per line) |
 | `-u USER` | **Required.** SSH username |
 | `-p PASS` | SSH password (prompted securely if omitted) |
 | `-k KEY_FILE` | SSH private key file for key-based authentication |
 | `-e` | Enter privileged EXEC (enable) mode after login |
-| `--port PORT` | SSH port (default: `22`) |
+| `--port PORT` | Default SSH port when no per-device port is specified (default: `22`) |
 | `-t SECONDS` | Connection timeout in seconds (default: `30`) |
 | `-o DIR` | Output directory (default: current directory) |
 | `-v` | Enable verbose/debug logging |
@@ -87,17 +88,36 @@ python config_grabber.py -i 192.168.1.1 -c examples/commands.txt -u admin -e -o 
 python config_grabber.py -i 10.0.0.1,10.0.0.2 -c examples/commands.txt -u netops --port 2222 -v -o output
 ```
 
+### PAT/NAT environments — per-device ports on the CLI
+
+```bash
+# Each device has its own SSH port (PAT through a firewall)
+python config_grabber.py -i 203.0.113.1:2221,203.0.113.1:2222 -c examples/commands.txt -u admin -o output
+```
+
+### PAT/NAT environments — per-device ports in a file
+
+```bash
+python config_grabber.py -f examples/devices.txt -c examples/commands.txt -u admin -o output
+```
+
 ## Input File Formats
 
 ### devices.txt (IP list)
+
+Bare IPs use the `--port` default. Add `:PORT` to override per device:
 
 ```
 # Lines starting with '#' are comments - they are ignored
 # Blank lines are also ignored
 
+# Standard port (uses --port default, typically 22)
 192.168.1.1
 192.168.1.2
-10.0.0.1
+
+# PAT'd devices with custom per-device ports
+10.0.0.1:2221
+10.0.0.2:2222
 ```
 
 ### commands.txt (command list)

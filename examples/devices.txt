@@ -3,18 +3,23 @@
 # Lines starting with '#' are treated as comments and ignored.
 # Blank lines are also ignored.
 #
+# PAT/NAT environments:
+#   Use IP:PORT notation to specify a per-device SSH port.
+#   If no port is given, the --port argument is used (default: 22).
+#
 # Usage:
 #   python config_grabber.py -f examples/devices.txt -c examples/commands.txt -u admin
+#   python config_grabber.py -f examples/devices.txt -c examples/commands.txt -u admin --port 2200
 
-# Core switches
+# Core switches - standard port 22 (uses --port default)
 192.168.1.1
 192.168.1.2
 
-# Distribution switches
-10.0.0.1
-10.0.0.2
+# Distribution switches - PAT'd through a firewall on custom ports
+10.0.0.1:2221
+10.0.0.2:2222
 
-# Access switches
+# Access switches - mix of standard and PAT'd
 172.16.5.10
-172.16.5.11
-172.16.5.12
+172.16.5.11:22100
+172.16.5.12:22101

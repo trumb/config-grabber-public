@@ -65,14 +65,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="config_grabber",
         description=(
             "Connect to one or more network switches via SSH, run a list of "
-            "commands, and save the output to timestamped .txt files."
+            "commands, and save the output to timestamped .txt files.\n\n"
+            "Devices may include an optional port using IP:PORT notation "
+            "(e.g. 10.0.0.1:2222) for PAT/NAT environments. When no port "
+            "is given, --port is used as the default."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python config_grabber.py -f devices.txt -c commands.txt -u admin\n"
-            "  python config_grabber.py -i 192.168.1.1 -c commands.txt -u admin -k ~/.ssh/id_rsa\n"
-            "  python config_grabber.py -i 192.168.1.1,10.0.0.1 -c commands.txt -u admin -e\n"
+            "  python config_grabber.py -i 192.168.1.1:2222 -c commands.txt -u admin -k ~/.ssh/id_rsa\n"
+            "  python config_grabber.py -i 10.0.0.1:2222,10.0.0.2:2223 -c commands.txt -u admin -e\n"
         ),
     )
 
@@ -181,25 +184,80 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
+# Device Entry Parsing
+# ---------------------------------------------------------------------------
+def parse_device_entry(strEntry: str, intDefaultPort: int) -> tuple:
+    """
+    Parse a device entry that may include an optional port number.
+
+    Supports the following formats:
+      - ``192.168.1.1``          → uses intDefaultPort
+      - ``192.168.1.1:2222``     → uses port 2222
+      - ``[::1]:2222``           → IPv6 with explicit port (bracket notation)
+      - ``::1``                  → bare IPv6, uses intDefaultPort
+
+    Args:
+        strEntry       (str): Raw device string from CLI or file.
+        intDefaultPort (int): Port to use when none is embedded in strEntry.
+
+    Returns:
+        tuple[str, int]: A (host, port) pair ready to pass to the SSH client.
+    """
+    strEntry = strEntry.strip()
+
+    # --- Handle IPv6 bracket notation: [::1]:port ---
+    if strEntry.startswith("["):
+        intCloseBracket = strEntry.find("]")
+        if intCloseBracket == -1:
+            # Malformed bracket notation - treat whole string as host
+            return strEntry, intDefaultPort
+        strHost = strEntry[1:intCloseBracket]  # content between [ and ]
+        strRemainder = strEntry[intCloseBracket + 1:]  # everything after ]
+        if strRemainder.startswith(":"):
+            try:
+                intPort = int(strRemainder[1:])
+                return strHost, intPort
+            except ValueError:
+                pass  # Non-numeric port - fall through to default
+        return strHost, intDefaultPort
+
+    # --- Handle IPv4 / hostname with optional port: host:port ---
+    # Count colons: exactly one colon means host:port for IPv4/hostname.
+    # More than one colon means a bare IPv6 address (no port specified).
+    listParts = strEntry.rsplit(":", 1)  # split on the LAST colon only
+    if len(listParts) == 2:
+        strPotentialHost, strPotentialPort = listParts
+        # Only treat as host:port if the port portion looks like an integer
+        # and the host portion is not itself a colon-containing IPv6 address.
+        if strPotentialPort.isdigit() and ":" not in strPotentialHost:
+            return strPotentialHost, int(strPotentialPort)
+
+    # --- No port found - use default ---
+    return strEntry, intDefaultPort
+
+
+# ---------------------------------------------------------------------------
 # Input File Readers
 # ---------------------------------------------------------------------------
-def load_ip_list(strFilePath: str) -> list:
+def load_ip_list(strFilePath: str, intDefaultPort: int) -> list:
     """
-    Read a text file and return a list of IP address strings.
+    Read a text file and return a list of (host, port) tuples.
 
+    Each line may be a bare IP/hostname or an ``IP:PORT`` pair.
     Lines that are blank or start with '#' (comments) are skipped.
     Leading/trailing whitespace is stripped from each line.
 
     Args:
-        strFilePath (str): Path to the file containing IP addresses.
+        strFilePath    (str): Path to the file containing IP addresses.
+        intDefaultPort (int): SSH port to use for lines that omit a port.
 
     Returns:
-        list[str]: Non-empty, stripped IP address strings.
+        list[tuple[str, int]]: Non-empty list of (host, port) pairs.
 
     Raises:
-        SystemExit: If the file cannot be opened.
+        SystemExit: If the file cannot be opened or contains no valid entries.
     """
-    listIPs = []
+    listDevices = []
     try:
         with open(strFilePath, "r", encoding="utf-8") as fileHandle:
             for strLine in fileHandle:
@@ -207,16 +265,18 @@ def load_ip_list(strFilePath: str) -> list:
                 # Skip blank lines and comment lines
                 if not strLine or strLine.startswith("#"):
                     continue
-                listIPs.append(strLine)
+                # Parse out the host and optional per-device port
+                tupleDevice = parse_device_entry(strLine, intDefaultPort)
+                listDevices.append(tupleDevice)
     except OSError as exc:
         logger.error("Cannot open IP file '%s': %s", strFilePath, exc)
         sys.exit(1)
 
-    if not listIPs:
+    if not listDevices:
         logger.error("IP file '%s' contains no valid entries.", strFilePath)
         sys.exit(1)
 
-    return listIPs
+    return listDevices
 
 
 def load_command_list(strFilePath: str) -> list:
@@ -370,16 +430,17 @@ def send_enable(objChannel: paramiko.Channel, strEnablePassword: str) -> str:
     Returns:
         str: The output received during the enable sequence (for logging).
     """
-    # Send the 'enable' command followed by a newline
-    objChannel.send("enable\n")
+    # Send the 'enable' command followed by a newline.
+    # paramiko's Channel.send() requires bytes, so we encode the string.
+    objChannel.send(b"enable\n")
     time.sleep(COMMAND_DELAY)
 
     # Read whatever the device sends back (should be a password prompt)
     strResponse = receive_output(objChannel)
     logger.debug("Enable prompt response: %s", strResponse.strip())
 
-    # Send the enable password
-    objChannel.send(strEnablePassword + "\n")
+    # Send the enable password (also encoded to bytes)
+    objChannel.send((strEnablePassword + "\n").encode("utf-8"))
     time.sleep(COMMAND_DELAY)
 
     # Read again - should now show the privileged prompt ending with '#'
@@ -483,7 +544,9 @@ def run_commands_on_device(
         # --- Optional: Enter enable/privileged mode ---
         if boolEnableMode:
             logger.info("[%s] Entering enable mode ...", strHost)
-            strEnableOutput = send_enable(objChannel, strEnablePassword)
+            # strEnablePassword is guaranteed non-None here because main()
+            # only sets boolEnableMode=True after prompting for the password.
+            strEnableOutput = send_enable(objChannel, strEnablePassword or "")
             listOutputParts.append(strEnableOutput)
             logger.info("[%s] Enable mode active.", strHost)
 
@@ -491,8 +554,9 @@ def run_commands_on_device(
         for strCmd in listCommands:
             logger.info("[%s] Running command: %s", strHost, strCmd)
 
-            # Send the command followed by a newline (carriage return)
-            objChannel.send(strCmd + "\n")
+            # Send the command followed by a newline.
+            # paramiko's Channel.send() requires bytes - encode the string.
+            objChannel.send((strCmd + "\n").encode("utf-8"))
 
             # Give the device time to process and respond
             time.sleep(COMMAND_DELAY)
@@ -585,16 +649,24 @@ def main() -> None:
         logger.debug("Verbose logging enabled.")
 
     # ------------------------------------------------------------------ #
-    # Resolve the list of target IP addresses
+    # Resolve the list of target devices as (host, port) tuples
     # ------------------------------------------------------------------ #
+    # objArgs.port is the global default; individual devices may override it
+    # using IP:PORT notation.
     if objArgs.ip:
-        # Split a comma-separated list and strip whitespace from each entry
-        listTargetIPs = [strIP.strip() for strIP in objArgs.ip.split(",") if strIP.strip()]
+        # Parse each comma-separated entry through parse_device_entry so that
+        # optional per-device ports (e.g. "10.0.0.1:2222") are respected.
+        listTargetDevices = [
+            parse_device_entry(strEntry.strip(), objArgs.port)
+            for strEntry in objArgs.ip.split(",")
+            if strEntry.strip()
+        ]
     else:
-        # Read IPs from the specified file
-        listTargetIPs = load_ip_list(objArgs.file)
+        # load_ip_list also returns (host, port) tuples; pass the default port
+        # so that lines without an explicit port fall back to --port.
+        listTargetDevices = load_ip_list(objArgs.file, objArgs.port)
 
-    logger.info("Loaded %d target device(s).", len(listTargetIPs))
+    logger.info("Loaded %d target device(s).", len(listTargetDevices))
 
     # ------------------------------------------------------------------ #
     # Load the list of commands to run
@@ -641,14 +713,16 @@ def main() -> None:
     intSuccess = 0  # Count of devices successfully processed
     intFailure = 0  # Count of devices that failed
 
-    for strIP in listTargetIPs:
+    for strHost, intDevicePort in listTargetDevices:
+        # intDevicePort comes from the IP:PORT entry (or the default --port
+        # value when no port was specified for this particular device).
         logger.info("=" * 60)
-        logger.info("Processing device: %s", strIP)
+        logger.info("Processing device: %s (port %d)", strHost, intDevicePort)
 
         # Run all commands on the device and collect the output
         strOutput = run_commands_on_device(
-            strHost=strIP,
-            intPort=objArgs.port,
+            strHost=strHost,
+            intPort=intDevicePort,      # per-device port, not the global default
             strUsername=objArgs.username,
             strPassword=strPassword,
             strKeyFile=objArgs.key,
@@ -659,12 +733,13 @@ def main() -> None:
         )
 
         if strOutput is not None:
-            # Build a uniquely-named output file for this device
-            strOutFile = build_output_filename(objArgs.output, strIP)
-            write_output_file(strOutFile, strIP, strOutput)
+            # Build a uniquely-named output file for this device.
+            # The filename uses the host only (no port) for readability.
+            strOutFile = build_output_filename(objArgs.output, strHost)
+            write_output_file(strOutFile, strHost, strOutput)
             intSuccess += 1
         else:
-            logger.warning("[%s] Skipped - no output captured due to errors.", strIP)
+            logger.warning("[%s] Skipped - no output captured due to errors.", strHost)
             intFailure += 1
 
     # ------------------------------------------------------------------ #
