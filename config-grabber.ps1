@@ -284,7 +284,11 @@ function Get-CommandList {
         exit 1
     }
 
-    return $listCommands
+    # The comma operator (,) prevents PowerShell from unwrapping a single-element
+    # collection to a scalar string, which would cause .Count to fail under
+    # Set-StrictMode -Version Latest. ToArray() converts the Generic.List to a
+    # plain string[] array that Invoke-DeviceCommands expects.
+    return ,$listCommands.ToArray()
 }
 
 # ---------------------------------------------------------------------------
