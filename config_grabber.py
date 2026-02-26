@@ -17,6 +17,7 @@ import argparse          # For parsing command-line arguments
 import getpass           # For securely prompting for passwords without echoing to terminal
 import logging           # For structured logging output
 import os                # For path and directory operations
+import re                # For paging-prompt pattern matching
 import sys               # For system exit on fatal errors
 import time              # For delays between commands if needed
 from datetime import datetime  # For generating ISO8601-formatted timestamps
@@ -49,6 +50,18 @@ RECV_BUFFER_SIZE: int = 65535
 
 # Maximum time (in seconds) to wait for a command's output to finish.
 RECV_TIMEOUT: float = 10.0
+
+# Compiled regex that matches common paging prompts using prefix matching.
+# Prefix matching ensures variants like ---(more 38%)--- are also caught:
+#   ---\(more  → ---(more)---, ---(more 38%)---, ---(more 100%)--- etc.
+#   --\(?[Mm]ore → --More--, --more--, --(More)--, --(more)-- etc.
+#   <---More   → <---More---> and similar variants
+PAGE_PATTERN: re.Pattern = re.compile(r"---\(more|--\(?[Mm]ore|<---More")
+
+# Module-level page-advance key (bytes for paramiko's channel.send()).
+# Starts as Space; toggled to Tab if Space fails, and back if Tab stops working.
+# Reset to Space at the start of each device session in run_commands_on_device().
+_bytesPageKey: bytes = b" "
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +182,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Directory where output files will be saved "
             "(default: current directory)."
+        ),
+    )
+
+    # --- Connection security ---
+    parser.add_argument(
+        "--ignore-host-key",
+        action="store_true",
+        default=False,
+        help=(
+            "Ignore SSH host key mismatches. Useful in PAT/NAT environments "
+            "where multiple devices share a single public IP on different "
+            "ports, each presenting a different host key. Without this flag, "
+            "paramiko's AutoAddPolicy is used (accepts unknown keys but may "
+            "warn on mismatches)."
+        ),
+    )
+
+    # --- Paging ---
+    parser.add_argument(
+        "--max-page-iterations",
+        type=int,
+        default=100,
+        metavar="N",
+        help=(
+            "Maximum number of paging prompts (--More-- / ---(more)---) to "
+            "advance through per command before stopping. Prevents infinite "
+            "loops on runaway output. Default: 100. Increase for very long "
+            "command outputs (e.g. --max-page-iterations 500)."
         ),
     )
 
@@ -487,6 +528,103 @@ def receive_output(objChannel: paramiko.Channel) -> str:
     return "".join(listChunks)
 
 
+def read_until_complete(
+    objChannel: paramiko.Channel,
+    strHost: str,
+    intMaxIterations: int,
+) -> str:
+    """
+    Read all pages of output from an SSH channel, handling paging prompts.
+
+    After an initial ``receive_output()`` call, loops while PAGE_PATTERN is
+    detected in the most recent chunk of output. On each page it sends the
+    current ``_bytesPageKey`` (Space by default). If Space produces no new
+    output, it toggles to Tab and retries. The successful key is remembered
+    in the module-level ``_bytesPageKey`` across calls within the same device
+    session (reset to Space at the start of each session).
+
+    Stops automatically when:
+      - No paging prompt is found in the latest chunk, or
+      - ``intMaxIterations`` pages have been advanced, or
+      - Both Space and Tab fail to produce new output.
+
+    Finally, strips all paging prompt lines from the accumulated output so
+    they do not appear in the saved config file.
+
+    Args:
+        objChannel      (paramiko.Channel) : Active SSH shell channel to read from.
+        strHost         (str)              : Device IP/hostname for log messages.
+        intMaxIterations (int)             : Maximum page-advances before stopping.
+
+    Returns:
+        str: All accumulated output with paging prompts stripped out.
+    """
+    # _bytesPageKey is a module-level variable (reset per device session).
+    # Using 'global' here so that toggling Space<->Tab is visible across calls.
+    global _bytesPageKey
+
+    # Read the initial chunk of output from the channel
+    strChunk = receive_output(objChannel)
+    strAccumulated = strChunk
+    intPageCount = 0
+
+    # Loop while the most-recently-received chunk contains a paging prompt
+    while PAGE_PATTERN.search(strChunk):
+
+        # Safety: stop if we've advanced the maximum allowed number of pages
+        if intPageCount >= intMaxIterations:
+            logger.warning(
+                "[%s] Max page iterations (%d) reached - output may be incomplete.",
+                strHost, intMaxIterations,
+            )
+            break
+        intPageCount += 1
+
+        # Send the current page-advance keystroke (no newline) and wait
+        objChannel.send(_bytesPageKey)
+        time.sleep(COMMAND_DELAY)
+        strChunk = receive_output(objChannel)
+
+        # If the current key produced no output, toggle Space<->Tab and retry
+        if not strChunk:
+            strOldKeyName = "Space" if _bytesPageKey == b" " else "Tab"
+            _bytesPageKey = b"\t" if _bytesPageKey == b" " else b" "
+            strNewKeyName = "Space" if _bytesPageKey == b" " else "Tab"
+            logger.warning(
+                "[%s] Paging key '%s' produced no output at page %d; switching to '%s'.",
+                strHost, strOldKeyName, intPageCount, strNewKeyName,
+            )
+
+            objChannel.send(_bytesPageKey)
+            time.sleep(COMMAND_DELAY)
+            strChunk = receive_output(objChannel)
+
+        # If both keys failed, abort the paging loop
+        if not strChunk:
+            logger.warning(
+                "[%s] Both Space and Tab failed to advance pager at page %d. Stopping.",
+                strHost, intPageCount,
+            )
+            break
+
+        strAccumulated += strChunk
+
+    # Strip all paging prompt lines from the final accumulated output.
+    # Uses [^\r\n]* to greedily consume the rest of each prompt line so that
+    # variants like ---(more 38%)--- are fully removed, not just the prefix.
+    strAccumulated = re.sub(
+        r"[ \t]*(?:---\(more[^\r\n]*|--\(?[Mm]ore[^\r\n]*|<---More[^\r\n]*)[ \t]*\r?\n?",
+        "",
+        strAccumulated,
+    )
+
+    logger.debug(
+        "[%s] read_until_complete: %d page(s) advanced, %d chars total.",
+        strHost, intPageCount, len(strAccumulated),
+    )
+    return strAccumulated
+
+
 def run_commands_on_device(
     strHost: str,
     intPort: int,
@@ -497,21 +635,23 @@ def run_commands_on_device(
     strEnablePassword: str | None,
     listCommands: list,
     floatTimeout: float,
+    intMaxPageIterations: int = 100,
 ) -> str | None:
     """
     Connect to a single device, optionally enter enable mode, run all
     commands, and return the captured output as a single string.
 
     Args:
-        strHost           (str)        : Device IP or hostname.
-        intPort           (int)        : SSH port.
-        strUsername       (str)        : SSH login username.
-        strPassword       (str|None)   : SSH password (None for key-only).
-        strKeyFile        (str|None)   : Private key file path.
-        boolEnableMode    (bool)       : Whether to enter privileged EXEC mode.
-        strEnablePassword (str|None)   : Password for enable mode.
-        listCommands      (list[str])  : Commands to execute sequentially.
-        floatTimeout      (float)      : SSH connection timeout.
+        strHost              (str)      : Device IP or hostname.
+        intPort              (int)      : SSH port.
+        strUsername          (str)      : SSH login username.
+        strPassword          (str|None) : SSH password (None for key-only).
+        strKeyFile           (str|None) : Private key file path.
+        boolEnableMode       (bool)     : Whether to enter privileged EXEC mode.
+        strEnablePassword    (str|None) : Password for enable mode.
+        listCommands         (list[str]): Commands to execute sequentially.
+        floatTimeout         (float)    : SSH connection timeout.
+        intMaxPageIterations (int)      : Max paging prompts to advance per command.
 
     Returns:
         str  : Full captured output, or
@@ -522,6 +662,15 @@ def run_commands_on_device(
 
     try:
         logger.info("[%s] Connecting on port %d ...", strHost, intPort)
+
+        # Reset the page-advance key to Space at the start of each device
+        # session so every device gets a fair first attempt with Space.
+        # The module-level _bytesPageKey may have been toggled to Tab by a
+        # previous device that required Tab; we reset it here so the new
+        # device isn't penalised for the previous device's preferences.
+        global _bytesPageKey
+        _bytesPageKey = b" "
+
         objClient = create_ssh_client(
             strHost, intPort, strUsername, strPassword, strKeyFile, floatTimeout
         )
@@ -558,11 +707,13 @@ def run_commands_on_device(
             # paramiko's Channel.send() requires bytes - encode the string.
             objChannel.send((strCmd + "\n").encode("utf-8"))
 
-            # Give the device time to process and respond
+            # Give the device time to begin processing and start sending output
             time.sleep(COMMAND_DELAY)
 
-            # Read the output for this command
-            strCmdOutput = receive_output(objChannel)
+            # read_until_complete() handles --More-- / ---(more)--- paging
+            # automatically, advancing with Space (or Tab) until all output
+            # is received, then strips the paging prompts from the result.
+            strCmdOutput = read_until_complete(objChannel, strHost, intMaxPageIterations)
             listOutputParts.append(strCmdOutput)
 
             logger.debug("[%s] Output (%d chars)", strHost, len(strCmdOutput))
@@ -678,18 +829,29 @@ def main() -> None:
     # Resolve credentials (prompt for anything not provided on the CLI)
     # ------------------------------------------------------------------ #
 
-    # SSH Password: prompt securely if not supplied via -p
+    # Password resolution priority:
+    #   1. Explicit -p / --password argument
+    #   2. CONFIG_GRABBER_PASSWORD environment variable
+    #   3. Key-only auth (if -k is set, no password needed)
+    #   4. Interactive secure prompt (last resort)
     strPassword = objArgs.password
-    if strPassword is None and objArgs.key is None:
-        # Neither a password nor a key was provided - must prompt for password
-        strPassword = getpass.getpass(
-            prompt=f"SSH password for user '{objArgs.username}': "
-        )
-    elif strPassword is None and objArgs.key:
-        # A key file was given; password is optional (may still be needed
-        # if the key itself is passphrase-protected - paramiko handles that
-        # interactively).  Only ask if the user also wants password auth.
-        pass  # key-only authentication; no password required
+    if strPassword is None:
+        # Check environment variable
+        strEnvPassword = os.environ.get("CONFIG_GRABBER_PASSWORD")
+        if strEnvPassword:
+            logger.info("Credential source: CONFIG_GRABBER_PASSWORD environment variable.")
+            strPassword = strEnvPassword
+        elif objArgs.key:
+            # Key file provided; password is optional
+            logger.info("Credential source: key-only authentication (no password).")
+        else:
+            # Last resort: interactive secure prompt
+            logger.info("No stored credential found. Prompting for SSH password.")
+            strPassword = getpass.getpass(
+                prompt=f"SSH password for user '{objArgs.username}': "
+            )
+    else:
+        logger.debug("Credential source: explicit --password argument.")
 
     # Enable Password: prompt if --enable was specified
     strEnablePassword = None
@@ -719,10 +881,11 @@ def main() -> None:
         logger.info("=" * 60)
         logger.info("Processing device: %s (port %d)", strHost, intDevicePort)
 
-        # Run all commands on the device and collect the output
+        # Run all commands on the device and collect the output.
+        # intMaxPageIterations comes from --max-page-iterations (default 100).
         strOutput = run_commands_on_device(
             strHost=strHost,
-            intPort=intDevicePort,      # per-device port, not the global default
+            intPort=intDevicePort,                          # per-device port, not the global default
             strUsername=objArgs.username,
             strPassword=strPassword,
             strKeyFile=objArgs.key,
@@ -730,6 +893,7 @@ def main() -> None:
             strEnablePassword=strEnablePassword,
             listCommands=listCommands,
             floatTimeout=objArgs.timeout,
+            intMaxPageIterations=objArgs.max_page_iterations,  # argparse converts - to _ in dest
         )
 
         if strOutput is not None:
