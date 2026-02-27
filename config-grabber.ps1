@@ -122,6 +122,13 @@ param (
     [ValidateRange(1, 10000)]
     [int]$MaxPageIterations = 100,
 
+    # --- Credential persistence ---
+    [Parameter()]
+    [string]$CredentialFile,
+
+    [Parameter()]
+    [switch]$SaveCredential,
+
     # --- Connection security ---
     [Parameter()]
     [switch]$IgnoreHostKeyMismatch,
@@ -695,8 +702,9 @@ Write-Log "Loaded $($arrCommands.Count) command(s) to execute."
 # Password resolution priority:
 #   1. Explicit -Password argument (already in $Password if supplied)
 #   2. CONFIG_GRABBER_PASSWORD environment variable
-#   3. Key-only auth (if -KeyFile is set, no password needed)
-#   4. Interactive secure prompt (last resort)
+#   3. Credential file (-CredentialFile, encrypted with DPAPI via Export-Clixml)
+#   4. Key-only auth (if -KeyFile is set, no password needed)
+#   5. Interactive secure prompt (last resort)
 if ($null -eq $Password) {
     # Check environment variable first
     $strEnvPassword = $env:CONFIG_GRABBER_PASSWORD
@@ -705,14 +713,25 @@ if ($null -eq $Password) {
         $Password = ConvertTo-SecureString -String $strEnvPassword -AsPlainText -Force
         $strEnvPassword = $null   # clear plain text reference
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($KeyFile)) {
-        # Key file was given; create a dummy empty-password credential for Posh-SSH.
-        # Posh-SSH requires a PSCredential even for key auth.
+    # Check credential file (DPAPI-encrypted PSCredential XML)
+    elseif (-not [string]::IsNullOrWhiteSpace($CredentialFile) -and (Test-Path $CredentialFile)) {
+        try {
+            Write-Log "Credential source: credential file '$CredentialFile'."
+            $objSavedCred = Import-Clixml -Path $CredentialFile -ErrorAction Stop
+            $Password = $objSavedCred.Password
+        }
+        catch {
+            Write-LogWarning "Failed to load credential file '$CredentialFile': $_"
+            Write-LogWarning 'Falling through to next credential source.'
+        }
+    }
+    # Key-only auth
+    if ($null -eq $Password -and -not [string]::IsNullOrWhiteSpace($KeyFile)) {
         Write-Log 'Credential source: key-only authentication (no password).'
         $Password = New-Object SecureString
     }
-    else {
-        # Neither password, env var, nor key provided - must prompt
+    # Interactive prompt (last resort)
+    if ($null -eq $Password) {
         Write-Log 'No stored credential found. Prompting for SSH password.'
         $Password = Read-Host -Prompt "SSH password for user '$Username'" -AsSecureString
     }
@@ -723,6 +742,25 @@ else {
 
 # Build the PSCredential object required by New-SSHSession
 $objCredential = New-Object System.Management.Automation.PSCredential($Username, $Password)
+
+# --- Save credential if -SaveCredential was specified ---
+# Uses Export-Clixml which encrypts the password with Windows DPAPI.
+# The resulting file is bound to the current user on the current machine.
+if ($SaveCredential) {
+    if (-not [string]::IsNullOrWhiteSpace($CredentialFile)) {
+        try {
+            $objCredential | Export-Clixml -Path $CredentialFile -Force
+            Write-Log "Credential saved to file: $CredentialFile"
+            Write-Log 'Note: File is DPAPI-encrypted (current user + current machine only).'
+        }
+        catch {
+            Write-LogWarning "Failed to save credential to file '$CredentialFile': $_"
+        }
+    }
+    else {
+        Write-LogWarning '-SaveCredential requires -CredentialFile <path> to specify where to save.'
+    }
+}
 
 # Enable password: prompt if -Enable was specified
 $secEnablePassword = $null
