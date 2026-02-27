@@ -13,6 +13,9 @@ Available in **two implementations** — choose the one that fits your environme
 | **SSH key auth** | ✅ RSA / Ed25519 | ✅ via Posh-SSH |
 | **Enable mode** | ✅ | ✅ |
 | **Per-device ports** | ✅ `IP:PORT` | ✅ `IP:PORT` |
+| **Automatic paging** | ✅ `--More--` handled | ✅ `--More--` handled |
+| **Env var password** | ✅ `CONFIG_GRABBER_PASSWORD` | ✅ `CONFIG_GRABBER_PASSWORD` |
+| **PAT host key fix** | ✅ `--ignore-host-key` | ✅ `-IgnoreHostKeyMismatch` |
 
 ---
 
@@ -23,6 +26,9 @@ Available in **two implementations** — choose the one that fits your environme
 - **Password** or **SSH key** authentication
 - Optional **enable / privileged EXEC mode** (Cisco-style)
 - Output saved as **`<IP>_<YYYY-MM-DDTHHMMSS>.txt`** per device
+- **Automatic paging** — handles `--More--` and `---(more)---` prompts with adaptive Space/Tab toggle
+- **`CONFIG_GRABBER_PASSWORD`** environment variable — CI/CD-friendly password injection
+- **Host key mismatch fix** for PAT/NAT — `--ignore-host-key` (Python) / `-IgnoreHostKeyMismatch` (PowerShell)
 - Graceful error handling — a failed device is logged and skipped
 
 ---
