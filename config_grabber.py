@@ -24,6 +24,15 @@ from datetime import datetime  # For generating ISO8601-formatted timestamps
 
 import paramiko          # Third-party SSH library for Python
 
+# keyring - cross-platform credential storage (Windows Credential Manager,
+# macOS Keychain, Linux SecretService). Optional: gracefully skipped if
+# not installed, with a warning when --save-credential is used.
+try:
+    import keyring       # pip install keyring
+    _boolKeyringAvailable = True
+except ImportError:
+    _boolKeyringAvailable = False
+
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
@@ -182,6 +191,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Directory where output files will be saved "
             "(default: current directory)."
+        ),
+    )
+
+    # --- Credential persistence ---
+    parser.add_argument(
+        "--save-credential",
+        action="store_true",
+        default=False,
+        help=(
+            "Save the SSH password to the OS credential store (Windows "
+            "Credential Manager, macOS Keychain, or Linux SecretService) "
+            "after resolving it. Requires the 'keyring' package. On next "
+            "run, the saved password will be used automatically."
         ),
     )
 
@@ -832,8 +854,9 @@ def main() -> None:
     # Password resolution priority:
     #   1. Explicit -p / --password argument
     #   2. CONFIG_GRABBER_PASSWORD environment variable
-    #   3. Key-only auth (if -k is set, no password needed)
-    #   4. Interactive secure prompt (last resort)
+    #   3. OS credential store via keyring (if available)
+    #   4. Key-only auth (if -k is set, no password needed)
+    #   5. Interactive secure prompt (last resort)
     strPassword = objArgs.password
     if strPassword is None:
         # Check environment variable
@@ -841,7 +864,17 @@ def main() -> None:
         if strEnvPassword:
             logger.info("Credential source: CONFIG_GRABBER_PASSWORD environment variable.")
             strPassword = strEnvPassword
-        elif objArgs.key:
+        # Check OS credential store (keyring)
+        elif _boolKeyringAvailable:
+            try:
+                strKeyringPassword = keyring.get_password("config-grabber", objArgs.username)
+                if strKeyringPassword:
+                    logger.info("Credential source: OS credential store (keyring).")
+                    strPassword = strKeyringPassword
+            except Exception as exc:
+                logger.debug("Keyring lookup failed: %s", exc)
+    if strPassword is None:
+        if objArgs.key:
             # Key file provided; password is optional
             logger.info("Credential source: key-only authentication (no password).")
         else:
@@ -850,8 +883,19 @@ def main() -> None:
             strPassword = getpass.getpass(
                 prompt=f"SSH password for user '{objArgs.username}': "
             )
-    else:
+    elif objArgs.password is not None:
         logger.debug("Credential source: explicit --password argument.")
+
+    # --- Save credential if --save-credential was specified ---
+    if objArgs.save_credential and strPassword:
+        if _boolKeyringAvailable:
+            try:
+                keyring.set_password("config-grabber", objArgs.username, strPassword)
+                logger.info("Credential saved to OS credential store (keyring) for user '%s'.", objArgs.username)
+            except Exception as exc:
+                logger.warning("Failed to save credential to keyring: %s", exc)
+        else:
+            logger.warning("--save-credential requires the 'keyring' package: pip install keyring")
 
     # Enable Password: prompt if --enable was specified
     strEnablePassword = None

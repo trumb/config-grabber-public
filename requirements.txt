@@ -4,3 +4,7 @@
 # paramiko - SSH2 protocol library for Python
 # Used for all SSH connections to network switches
 paramiko>=3.4.0
+
+# keyring - cross-platform credential storage
+# Used for saving/loading SSH passwords securely via the OS credential store
+keyring>=25.0.0
